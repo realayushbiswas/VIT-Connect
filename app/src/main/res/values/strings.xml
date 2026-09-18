@@ -1,0 +1,4 @@
+<resources>
+    <string name="app_name">VIT Connect</string>
+    <string name="nearby_service_id">com.offgridmesh.vitconnect.SERVICE_ID</string>
+</resources>
