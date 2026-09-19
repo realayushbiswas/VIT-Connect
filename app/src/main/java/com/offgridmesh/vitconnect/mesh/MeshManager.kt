@@ -18,10 +18,17 @@ import com.google.android.gms.nearby.connection.Payload
 import com.google.android.gms.nearby.connection.PayloadCallback
 import com.google.android.gms.nearby.connection.PayloadTransferUpdate
 import com.google.android.gms.nearby.connection.Strategy
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
 
 private const val TAG = "MeshManager"
 
@@ -32,6 +39,7 @@ private const val TAG = "MeshManager"
 // "while my app happens to stay open."
 private const val MAX_RELAY_CACHE_SIZE = 1000
 private const val RELAY_REPLAY_WINDOW_MS = 24 * 60 * 60 * 1000L // 24 hours
+private const val DISCOVERY_RESTART_INTERVAL_MS = 20 * 1000L // 20 seconds
 
 /**
  * Owns every Nearby Connections call for the app: advertising, discovery, connection
@@ -63,6 +71,11 @@ class MeshManager(private val appContext: Context) {
             if (_status.value == MeshStatus.RUNNING) {
                 connectionsClient.stopAdvertising()
                 startAdvertising()
+                // Refresh + rebroadcast the cached KEY_ANNOUNCE too — otherwise it keeps
+                // gossiping the *old* name to the rest of the mesh indefinitely (and, since
+                // it's persisted to disk, even across app restarts), which is what was
+                // showing up as stale names reappearing seemingly at random.
+                ensureKeyAnnounced()
             }
         }
 
@@ -85,6 +98,20 @@ class MeshManager(private val appContext: Context) {
     // direct-chat targets are picked from.
     private val _knownDevices = MutableStateFlow<Map<String, String>>(emptyMap())
     val knownDevices: StateFlow<Map<String, String>> = _knownDevices.asStateFlow()
+
+    // deviceId -> timestamp of the update currently reflected in _knownDevices. A cached
+    // KEY_ANNOUNCE can get replayed well after a device has since sent a fresher one (or
+    // renamed and rebroadcast) — without this, whichever update happens to arrive *last* wins,
+    // which is what caused old names to reappear seemingly at random. Every write site below
+    // goes through updateKnownDevice() so a stale update can never clobber a newer one.
+    private val knownDeviceTimestamps = mutableMapOf<String, Long>()
+
+    private fun updateKnownDevice(id: String, name: String, timestamp: Long) {
+        val existing = knownDeviceTimestamps[id]
+        if (existing != null && existing > timestamp) return
+        knownDeviceTimestamps[id] = timestamp
+        _knownDevices.update { it + (id to name) }
+    }
 
     // deviceId -> their EC public key, learned from KEY_ANNOUNCE gossip or a scanned QR
     // contact. Required to encrypt an outgoing direct message or decrypt an incoming one.
@@ -125,7 +152,8 @@ class MeshManager(private val appContext: Context) {
             return
         }
         knownPublicKeys[contact.deviceId] = keyBytes
-        _knownDevices.update { it + (contact.deviceId to contact.name) }
+        // A QR scan is in-person and "now" — it should always win over older gossip.
+        updateKnownDevice(contact.deviceId, contact.name, System.currentTimeMillis())
         _verifiedContactIds.update { it + contact.deviceId }
     }
 
@@ -185,19 +213,51 @@ class MeshManager(private val appContext: Context) {
         ensureKeyAnnounced()
         startAdvertising()
         startDiscovery()
+        startDiscoveryWatchdog()
+    }
+
+    private val watchdogScope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
+    private var discoveryWatchdogJob: Job? = null
+
+    /**
+     * Several OEM Android BLE stacks (Samsung and Xiaomi in particular are widely reported)
+     * silently go stale after running for a while — they stop surfacing new advertisements
+     * until the scan is restarted, with no error callback to tell us it happened. This is the
+     * "connection is spotty" symptom: nothing's actually wrong, the scanner just needs a kick.
+     * Periodically cycling discovery (not advertising — that could interrupt an in-progress
+     * handshake) is a cheap, safe mitigation and doesn't affect already-connected endpoints.
+     */
+    private fun startDiscoveryWatchdog() {
+        discoveryWatchdogJob?.cancel()
+        discoveryWatchdogJob = watchdogScope.launch {
+            while (isActive) {
+                delay(DISCOVERY_RESTART_INTERVAL_MS)
+                if (_status.value == MeshStatus.RUNNING || _status.value == MeshStatus.STARTING) {
+                    Log.d(TAG, "Restarting discovery (periodic BLE scanner refresh)")
+                    connectionsClient.stopDiscovery()
+                    // stopDiscovery() doesn't return a Task, so there's no way to await its
+                    // teardown — restarting immediately after can race with it and trigger a
+                    // spurious failure callback. A short delay gives the BLE stack time to
+                    // actually stop first.
+                    delay(300)
+                    startDiscovery()
+                }
+            }
+        }
     }
 
     /**
-     * Seeds our own public key into [relayCache] as a KEY_ANNOUNCE message. It doesn't need to
-     * be actively (re-)broadcast on a timer — [replayPendingMessagesTo] resends anything still
-     * in the cache to every peer as it connects, which is exactly the distribution KEY_ANNOUNCE
-     * needs. Idempotent: calling it again is harmless (same message id, cache just overwrites).
+     * (Re-)seeds our own public key + current name into [relayCache] as a KEY_ANNOUNCE message,
+     * and immediately broadcasts it to whoever's already connected — new peers still pick it up
+     * later via [replayPendingMessagesTo]. Safe to call anytime our name changes, not just at
+     * startup: same stable id, so it overwrites the previous cache entry rather than piling up
+     * duplicates, and re-broadcasting means already-connected peers get the update too instead
+     * of being stuck with whatever name we had when they first connected.
      */
     private fun ensureKeyAnnounced() {
         val announce = MeshMessage(
-            // Stable, not random: our public key never changes across restarts, so repeated
-            // start()/stop() cycles should overwrite the same cache slot rather than pile up
-            // duplicate announcements under different ids.
+            // Stable, not random: identifies "my current identity announcement" as one slot —
+            // a rename overwrites it rather than adding a second, stale copy alongside it.
             id = "key-announce-$deviceId",
             type = MeshMessageType.KEY_ANNOUNCE,
             senderId = deviceId,
@@ -206,9 +266,11 @@ class MeshManager(private val appContext: Context) {
             body = Base64.encodeToString(crypto.publicKeyBytes, Base64.NO_WRAP),
         )
         rememberForRelay(announce)
+        broadcastToPeers(announce.toBytes())
     }
 
     fun stop() {
+        discoveryWatchdogJob?.cancel()
         connectionsClient.stopAdvertising()
         connectionsClient.stopDiscovery()
         connectionsClient.stopAllEndpoints()
@@ -300,6 +362,19 @@ class MeshManager(private val appContext: Context) {
     // Advertising + discovery
     // ---------------------------------------------------------------------------------------
 
+    /**
+     * A failed startAdvertising()/startDiscovery() call only means "the mesh never came up" if
+     * we weren't already running. Once we've genuinely reached RUNNING, existing connections
+     * keep working regardless — a transient hiccup on a periodic discovery restart (the
+     * watchdog) shouldn't be able to flip the UI into a permanent, misleading error state for a
+     * session that's otherwise working fine.
+     */
+    private fun markErrorUnlessAlreadyRunning() {
+        if (_status.value != MeshStatus.RUNNING) {
+            _status.value = MeshStatus.ERROR
+        }
+    }
+
     private fun startAdvertising() {
         // setLowPower(false): trades battery for shorter BLE advertise/scan intervals, which
         // materially cuts the time it takes two phones to discover each other. Default Nearby
@@ -319,7 +394,7 @@ class MeshManager(private val appContext: Context) {
             _status.value = MeshStatus.RUNNING
         }.addOnFailureListener { e ->
             Log.e(TAG, "Advertising failed to start", e)
-            _status.value = MeshStatus.ERROR
+            markErrorUnlessAlreadyRunning()
         }
     }
 
@@ -337,7 +412,7 @@ class MeshManager(private val appContext: Context) {
             _status.value = MeshStatus.RUNNING
         }.addOnFailureListener { e ->
             Log.e(TAG, "Discovery failed to start", e)
-            _status.value = MeshStatus.ERROR
+            markErrorUnlessAlreadyRunning()
         }
     }
 
@@ -410,7 +485,8 @@ class MeshManager(private val appContext: Context) {
                         _peers.update { it - stale.endpointId }
                     }
                 _peers.update { it + (endpointId to peer) }
-                _knownDevices.update { it + (peer.deviceId to peer.displayName) }
+                // A live connection's advertised name is as fresh as it gets — always wins.
+                updateKnownDevice(peer.deviceId, peer.displayName, System.currentTimeMillis())
                 Log.d(TAG, "Connected: ${peer.displayName} ($endpointId)")
                 replayPendingMessagesTo(endpointId)
             } else {
@@ -491,7 +567,9 @@ class MeshManager(private val appContext: Context) {
                 return
             }
             knownPublicKeys[message.senderId] = pubKeyBytes
-            _knownDevices.update { it + (message.senderId to message.senderName) }
+            // Use the announcement's own timestamp, not "now" — a replayed copy of an old
+            // announcement must never be able to overwrite a name update that arrived since.
+            updateKnownDevice(message.senderId, message.senderName, message.timestamp)
             Log.d(TAG, "Learned public key for ${message.senderName} (${message.senderId})")
         }
 
