@@ -4,11 +4,19 @@ import org.json.JSONObject
 import java.nio.charset.StandardCharsets
 import java.util.UUID
 
-/** Message kinds. Only TEXT is used in Phase 1; SOS / ACK land in later phases. */
+/** Message kinds. SOS lands in Phase 3; ACK is reserved for Phase 4 delivery status. */
 enum class MeshMessageType {
     TEXT,
     SOS,
-    ACK;
+    ACK,
+
+    /**
+     * Gossips this device's EC public key (base64 in [MeshMessage.body]) across the mesh via
+     * the normal flood/store-and-forward path. Never shown in any chat UI — [MeshManager]
+     * intercepts it to populate the known-devices directory and enable E2E encryption for
+     * direct messages, then relays it onward like any other message.
+     */
+    KEY_ANNOUNCE;
 
     companion object {
         fun fromWire(raw: String): MeshMessageType =
@@ -36,6 +44,12 @@ data class MeshMessage(
     val hopCount: Int = 0,
     val lat: Double? = null,
     val lon: Double? = null,
+    /**
+     * True when [body] holds base64-encoded AES-GCM ciphertext (a direct message only the
+     * device matching [targetId] can decrypt) rather than plaintext. Always false for
+     * broadcast/group messages and KEY_ANNOUNCE.
+     */
+    val encrypted: Boolean = false,
 ) {
     fun toBytes(): ByteArray {
         val json = JSONObject().apply {
@@ -50,6 +64,7 @@ data class MeshMessage(
             put("hopCount", hopCount)
             put("lat", lat ?: JSONObject.NULL)
             put("lon", lon ?: JSONObject.NULL)
+            put("encrypted", encrypted)
         }
         return json.toString().toByteArray(StandardCharsets.UTF_8)
     }
@@ -74,6 +89,7 @@ data class MeshMessage(
                 hopCount = json.getInt("hopCount"),
                 lat = if (json.isNull("lat")) null else json.getDouble("lat"),
                 lon = if (json.isNull("lon")) null else json.getDouble("lon"),
+                encrypted = json.optBoolean("encrypted", false),
             )
         } catch (e: Exception) {
             null

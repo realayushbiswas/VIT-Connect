@@ -72,6 +72,9 @@ dependencies {
     // Permissions handling (Accompanist) - simplifies runtime permission requests in Compose
     implementation("com.google.accompanist:accompanist-permissions:0.37.3")
 
+    // QR generation + scanning for in-person contact exchange (pulls in zxing-core transitively)
+    implementation("com.journeyapps:zxing-android-embedded:4.3.0")
+
     testImplementation("junit:junit:4.13.2")
     androidTestImplementation("androidx.test.ext:junit:1.2.1")
     androidTestImplementation("androidx.test.espresso:espresso-core:3.6.1")

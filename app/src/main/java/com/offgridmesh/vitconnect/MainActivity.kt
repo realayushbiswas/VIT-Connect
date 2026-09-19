@@ -20,6 +20,10 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.style.TextAlign
@@ -28,6 +32,9 @@ import com.google.accompanist.permissions.ExperimentalPermissionsApi
 import com.google.accompanist.permissions.rememberMultiplePermissionsState
 import com.offgridmesh.vitconnect.ui.MeshViewModel
 import com.offgridmesh.vitconnect.ui.screens.ChatScreen
+import com.offgridmesh.vitconnect.ui.screens.DirectChatScreen
+import com.offgridmesh.vitconnect.ui.screens.DirectoryScreen
+import com.offgridmesh.vitconnect.ui.screens.MyQrScreen
 import com.offgridmesh.vitconnect.ui.theme.MeshPurpleLight
 import com.offgridmesh.vitconnect.ui.theme.OffGridMeshTheme
 
@@ -87,10 +94,39 @@ private fun OffGridMeshRoot(viewModel: MeshViewModel) {
 
     if (permissionsState.allPermissionsGranted) {
         LaunchedEffect(Unit) { viewModel.start() }
-        ChatScreen(viewModel)
+        var screen by remember { mutableStateOf<AppScreen>(AppScreen.MeshChat) }
+        when (val current = screen) {
+            AppScreen.MeshChat -> ChatScreen(
+                viewModel = viewModel,
+                onOpenDirectory = { screen = AppScreen.Directory },
+            )
+            AppScreen.Directory -> DirectoryScreen(
+                viewModel = viewModel,
+                onBack = { screen = AppScreen.MeshChat },
+                onOpenChat = { deviceId -> screen = AppScreen.DirectChat(deviceId) },
+                onOpenMyQr = { screen = AppScreen.MyQr },
+            )
+            is AppScreen.DirectChat -> DirectChatScreen(
+                viewModel = viewModel,
+                peerDeviceId = current.peerDeviceId,
+                onBack = { screen = AppScreen.Directory },
+            )
+            AppScreen.MyQr -> MyQrScreen(
+                viewModel = viewModel,
+                onBack = { screen = AppScreen.Directory },
+                onContactAdded = { deviceId -> screen = AppScreen.DirectChat(deviceId) },
+            )
+        }
     } else {
         PermissionGateScreen(onRequestClick = { permissionsState.launchMultiplePermissionRequest() })
     }
+}
+
+private sealed class AppScreen {
+    data object MeshChat : AppScreen()
+    data object Directory : AppScreen()
+    data object MyQr : AppScreen()
+    data class DirectChat(val peerDeviceId: String) : AppScreen()
 }
 
 @Composable

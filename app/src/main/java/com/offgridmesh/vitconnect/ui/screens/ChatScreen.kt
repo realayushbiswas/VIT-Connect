@@ -23,6 +23,7 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Edit
+import androidx.compose.material.icons.filled.People
 import androidx.compose.material.icons.filled.Send
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Icon
@@ -56,7 +57,7 @@ import java.text.SimpleDateFormat
 import java.util.Locale
 
 @Composable
-fun ChatScreen(viewModel: MeshViewModel) {
+fun ChatScreen(viewModel: MeshViewModel, onOpenDirectory: () -> Unit) {
     val peers by viewModel.peers.collectAsState()
     val messages by viewModel.messages.collectAsState()
     val status by viewModel.status.collectAsState()
@@ -79,6 +80,7 @@ fun ChatScreen(viewModel: MeshViewModel) {
                 nameDraft = viewModel.displayName
                 showEditName = true
             },
+            onOpenDirectory = onOpenDirectory,
         )
         PeerStrip(peers = peers.values.toList())
 
@@ -136,17 +138,27 @@ private fun MeshHeader(
     peerCount: Int,
     displayName: String,
     onEditName: () -> Unit,
+    onOpenDirectory: () -> Unit,
 ) {
-    Surface(color = MaterialTheme.colorScheme.surface) {
+    Surface(color = MaterialTheme.colorScheme.surface, modifier = Modifier.fillMaxWidth()) {
         Column(modifier = Modifier.padding(16.dp, 14.dp, 16.dp, 10.dp)) {
-            Row(verticalAlignment = Alignment.CenterVertically) {
+            Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
                 Text(
                     "VIT Connect",
                     style = MaterialTheme.typography.titleLarge,
                     color = MaterialTheme.colorScheme.onSurface,
+                    modifier = Modifier.weight(1f),
                 )
                 Spacer(Modifier.width(8.dp))
                 StatusDot(status)
+                Spacer(Modifier.width(10.dp))
+                IconButton(onClick = onOpenDirectory, modifier = Modifier.size(28.dp)) {
+                    Icon(
+                        Icons.Filled.People,
+                        contentDescription = "Direct messages",
+                        tint = MaterialTheme.colorScheme.onSurface,
+                    )
+                }
             }
             Spacer(Modifier.height(4.dp))
             Row(verticalAlignment = Alignment.CenterVertically) {
@@ -237,7 +249,7 @@ private fun PeerStrip(peers: List<PeerInfo>) {
 }
 
 @Composable
-private fun MessageBubble(msg: MeshMessage, isMine: Boolean) {
+fun MessageBubble(msg: MeshMessage, isMine: Boolean) {
     val bubbleColor = if (isMine) MeshPurple else MeshSurfaceVariant
     val align = if (isMine) Alignment.End else Alignment.Start
     val timeFmt = remember { SimpleDateFormat("HH:mm", Locale.getDefault()) }
@@ -277,10 +289,11 @@ private fun MessageBubble(msg: MeshMessage, isMine: Boolean) {
 }
 
 @Composable
-private fun MessageInputBar(
+fun MessageInputBar(
     value: String,
     onValueChange: (String) -> Unit,
     onSend: () -> Unit,
+    placeholder: String = "Message the mesh…",
 ) {
     Surface(
         color = MaterialTheme.colorScheme.surface,
@@ -299,7 +312,7 @@ private fun MessageInputBar(
                 value = value,
                 onValueChange = onValueChange,
                 modifier = Modifier.weight(1f),
-                placeholder = { Text("Message the mesh…") },
+                placeholder = { Text(placeholder) },
                 singleLine = true,
             )
             Spacer(Modifier.width(8.dp))
