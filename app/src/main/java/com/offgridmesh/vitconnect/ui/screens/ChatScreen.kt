@@ -24,6 +24,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.People
+import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Send
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Icon
@@ -57,7 +58,7 @@ import java.text.SimpleDateFormat
 import java.util.Locale
 
 @Composable
-fun ChatScreen(viewModel: MeshViewModel, onOpenDirectory: () -> Unit) {
+fun ChatScreen(viewModel: MeshViewModel, onOpenDirectory: () -> Unit, onOpenSearch: () -> Unit) {
     val peers by viewModel.peers.collectAsState()
     val messages by viewModel.messages.collectAsState()
     val status by viewModel.status.collectAsState()
@@ -81,6 +82,7 @@ fun ChatScreen(viewModel: MeshViewModel, onOpenDirectory: () -> Unit) {
                 showEditName = true
             },
             onOpenDirectory = onOpenDirectory,
+            onOpenSearch = onOpenSearch,
         )
         PeerStrip(peers = peers.values.toList())
 
@@ -139,6 +141,7 @@ private fun MeshHeader(
     displayName: String,
     onEditName: () -> Unit,
     onOpenDirectory: () -> Unit,
+    onOpenSearch: () -> Unit,
 ) {
     Surface(color = MaterialTheme.colorScheme.surface, modifier = Modifier.fillMaxWidth()) {
         Column(modifier = Modifier.padding(16.dp, 14.dp, 16.dp, 10.dp)) {
@@ -151,6 +154,14 @@ private fun MeshHeader(
                 )
                 Spacer(Modifier.width(8.dp))
                 StatusDot(status)
+                Spacer(Modifier.width(10.dp))
+                IconButton(onClick = onOpenSearch, modifier = Modifier.size(28.dp)) {
+                    Icon(
+                        Icons.Filled.Search,
+                        contentDescription = "Search and Ask AI",
+                        tint = MaterialTheme.colorScheme.onSurface,
+                    )
+                }
                 Spacer(Modifier.width(10.dp))
                 IconButton(onClick = onOpenDirectory, modifier = Modifier.size(28.dp)) {
                     Icon(

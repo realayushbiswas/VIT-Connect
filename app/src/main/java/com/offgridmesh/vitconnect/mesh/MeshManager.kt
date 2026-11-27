@@ -4,6 +4,19 @@ import android.content.Context
 import android.util.Base64
 import android.util.Log
 import com.offgridmesh.vitconnect.R
+import com.offgridmesh.vitconnect.mesh.gateway.GatewayAnnounce
+import com.offgridmesh.vitconnect.mesh.gateway.GatewayInfo
+import com.offgridmesh.vitconnect.mesh.gateway.GatewayLimits
+import com.offgridmesh.vitconnect.mesh.gateway.GatewayRegistry
+import com.offgridmesh.vitconnect.mesh.gateway.GatewaySettings
+import com.offgridmesh.vitconnect.mesh.gateway.InternetMonitor
+import com.offgridmesh.vitconnect.mesh.gateway.QueryItem
+import com.offgridmesh.vitconnect.mesh.gateway.QueryKind
+import com.offgridmesh.vitconnect.mesh.gateway.QueryRequest
+import com.offgridmesh.vitconnect.mesh.gateway.QueryResponse
+import com.offgridmesh.vitconnect.mesh.gateway.QuerySandbox
+import com.offgridmesh.vitconnect.mesh.gateway.QueryStatus
+import com.offgridmesh.vitconnect.mesh.gateway.RateLimiter
 import com.google.android.gms.nearby.Nearby
 import com.google.android.gms.nearby.connection.AdvertisingOptions
 import com.google.android.gms.nearby.connection.ConnectionInfo
@@ -18,6 +31,7 @@ import com.google.android.gms.nearby.connection.Payload
 import com.google.android.gms.nearby.connection.PayloadCallback
 import com.google.android.gms.nearby.connection.PayloadTransferUpdate
 import com.google.android.gms.nearby.connection.Strategy
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -29,6 +43,9 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
+import java.util.UUID
 
 private const val TAG = "MeshManager"
 
@@ -40,6 +57,20 @@ private const val TAG = "MeshManager"
 private const val MAX_RELAY_CACHE_SIZE = 1000
 private const val RELAY_REPLAY_WINDOW_MS = 24 * 60 * 60 * 1000L // 24 hours
 private const val DISCOVERY_RESTART_INTERVAL_MS = 20 * 1000L // 20 seconds
+
+// Internet-gateway tuning. A gateway re-announces every GATEWAY_HEARTBEAT_MS; requesters drop one
+// that has been silent for GatewayRegistry.DEFAULT_TTL_MS. Gateway traffic is perishable, so it
+// is only replayed to newly connected peers for a short window (unlike chat's 24 hours).
+private const val GATEWAY_TICK_MS = 10 * 1000L
+private const val GATEWAY_HEARTBEAT_MS = 45 * 1000L
+private const val MAX_EPHEMERAL_CACHE_SIZE = 200
+private const val ANNOUNCE_REPLAY_WINDOW_MS = 60 * 1000L
+private const val QUERY_REPLAY_WINDOW_MS = 10 * 60 * 1000L
+private const val QUERY_DEADLINE_MS = 3 * 60 * 1000L // give up on a query after 3 minutes
+private const val QUERY_ATTEMPT_TIMEOUT_MS = 30 * 1000L // per gateway, before trying the next-nearest
+private const val QUERY_POLL_MS = 3 * 1000L // how often a waiting query re-checks for a gateway
+private const val MAX_QUERY_ATTEMPTS = 3
+private const val MAX_QUERIES_SHOWN = 30
 
 /**
  * Owns every Nearby Connections call for the app: advertising, discovery, connection
@@ -180,6 +211,55 @@ class MeshManager(private val appContext: Context) {
     // that connect after a message was already in flight. Bounded by MAX_RELAY_CACHE_SIZE.
     private val relayCache = LinkedHashMap<String, MeshMessage>()
 
+    // ---- Internet gateway state (see the "Internet gateway" section below) ----
+
+    /** The owner's opt-in switch and API keys for serving the mesh. Off by default. */
+    val gatewaySettings = GatewaySettings(appContext)
+    private val internet = InternetMonitor(appContext)
+
+    /** True while this device itself has working internet. */
+    val hasInternet: StateFlow<Boolean> = internet.online
+
+    private val sandbox = QuerySandbox(gatewaySettings)
+    private val gatewayRegistry = GatewayRegistry()
+    private val requestLimiter =
+        RateLimiter(GatewayLimits.RATE_LIMIT_REQUESTS, GatewayLimits.RATE_LIMIT_WINDOW_MS)
+
+    private val _gateways = MutableStateFlow<List<GatewayInfo>>(emptyList())
+
+    /** Gateways currently reachable through the mesh, nearest first. */
+    val gateways: StateFlow<List<GatewayInfo>> = _gateways.asStateFlow()
+
+    private val _servingAsGateway = MutableStateFlow(false)
+
+    /** True while this device is online, opted in, has a key, and is announcing itself as a gateway. */
+    val servingAsGateway: StateFlow<Boolean> = _servingAsGateway.asStateFlow()
+
+    private val _queries = MutableStateFlow<List<QueryItem>>(emptyList())
+
+    /** Search / AI queries made on this device, newest first. In memory only. */
+    val queries: StateFlow<List<QueryItem>> = _queries.asStateFlow()
+
+    // messageId -> message for gateway traffic (announces, requests, responses). Same dedupe +
+    // short store-and-forward job as relayCache, but in memory only: these are perishable and
+    // can carry multi-KB answers, so they must not crowd out chat history or be written to disk.
+    private val ephemeralCache = LinkedHashMap<String, MeshMessage>()
+
+    private class PendingQuery(val gatewayId: String, val reply: CompletableDeferred<QueryResponse>)
+
+    private val pendingQueries = mutableMapOf<String, PendingQuery>()
+    private var activeExecutions = 0
+    private var gatewayLoopJob: Job? = null
+    private var lastAnnounceAt = 0L
+    private var wasServing = false
+
+    private fun rememberEphemeral(message: MeshMessage) {
+        ephemeralCache[message.id] = message
+        if (ephemeralCache.size > MAX_EPHEMERAL_CACHE_SIZE) {
+            ephemeralCache.remove(ephemeralCache.keys.first())
+        }
+    }
+
     private fun rememberForRelay(message: MeshMessage, persist: Boolean = true) {
         relayCache[message.id] = message
         if (relayCache.size > MAX_RELAY_CACHE_SIZE) {
@@ -214,9 +294,14 @@ class MeshManager(private val appContext: Context) {
         startAdvertising()
         startDiscovery()
         startDiscoveryWatchdog()
+        startGatewayLoop()
     }
 
-    private val watchdogScope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
+    // Main-thread scope shared by the discovery watchdog and all gateway work, so the mutable
+    // state below is only ever touched from the thread Nearby's callbacks already run on.
+    // Blocking network calls hop to Dispatchers.IO and come straight back (see runQuery /
+    // handleQueryRequest).
+    private val meshScope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
     private var discoveryWatchdogJob: Job? = null
 
     /**
@@ -229,7 +314,7 @@ class MeshManager(private val appContext: Context) {
      */
     private fun startDiscoveryWatchdog() {
         discoveryWatchdogJob?.cancel()
-        discoveryWatchdogJob = watchdogScope.launch {
+        discoveryWatchdogJob = meshScope.launch {
             while (isActive) {
                 delay(DISCOVERY_RESTART_INTERVAL_MS)
                 if (_status.value == MeshStatus.RUNNING || _status.value == MeshStatus.STARTING) {
@@ -271,12 +356,18 @@ class MeshManager(private val appContext: Context) {
 
     fun stop() {
         discoveryWatchdogJob?.cancel()
+        gatewayLoopJob?.cancel()
         connectionsClient.stopAdvertising()
         connectionsClient.stopDiscovery()
         connectionsClient.stopAllEndpoints()
         pendingOrConnected.clear()
         pendingEndpointNames.clear()
         relayCache.clear()
+        ephemeralCache.clear()
+        gatewayRegistry.clear()
+        _gateways.value = emptyList()
+        _servingAsGateway.value = false
+        wasServing = false
         _peers.value = emptyMap()
         _status.value = MeshStatus.IDLE
     }
@@ -356,6 +447,283 @@ class MeshManager(private val appContext: Context) {
         if (toReplay.isNotEmpty()) {
             Log.d(TAG, "Replayed ${toReplay.size} store-and-forward message(s) to $endpointId")
         }
+
+        // Gateway traffic gets the same treatment on a much shorter leash: a request addressed to
+        // a gateway that wasn't reachable yet can still get there, but a stale announce must not
+        // keep a vanished gateway looking alive.
+        val now = System.currentTimeMillis()
+        for (message in ephemeralCache.values) {
+            val window = if (message.type == MeshMessageType.GATEWAY_ANNOUNCE) ANNOUNCE_REPLAY_WINDOW_MS else QUERY_REPLAY_WINDOW_MS
+            if (message.ttl > 0 && now - message.timestamp <= window) {
+                connectionsClient.sendPayload(endpointId, Payload.fromBytes(message.toBytes()))
+                    .addOnFailureListener { e -> Log.w(TAG, "gateway replay to $endpointId failed", e) }
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Internet gateway: search / AI for devices with no connection of their own
+    // ---------------------------------------------------------------------------------------
+    //
+    // A device with working internet, whose owner has opted in and supplied API keys, announces
+    // itself as a gateway. A device without internet picks the nearest gateway (fewest hops),
+    // sends it an encrypted QUERY_REQUEST through the normal relay mesh, and the gateway runs the
+    // query inside [QuerySandbox] and returns an encrypted QUERY_RESPONSE the same way. If the
+    // gateway doesn't answer in time the next-nearest is tried. Relays in between only ever see
+    // ciphertext; only the gateway sees the query text.
+
+    private fun gatewayKindsOffered(): Set<QueryKind> =
+        if (gatewaySettings.shareEnabled.value && internet.online.value) gatewaySettings.capabilities() else emptySet()
+
+    /** Heartbeat: expire stale gateways, and (re)announce ourselves while we're one. */
+    private fun startGatewayLoop() {
+        gatewayLoopJob?.cancel()
+        gatewayLoopJob = meshScope.launch {
+            while (isActive) {
+                val now = System.currentTimeMillis()
+                _gateways.value = gatewayRegistry.active(now)
+
+                val kinds = gatewayKindsOffered()
+                val serving = kinds.isNotEmpty()
+                _servingAsGateway.value = serving
+                when {
+                    serving && (!wasServing || now - lastAnnounceAt >= GATEWAY_HEARTBEAT_MS) -> {
+                        announceGateway(kinds)
+                        lastAnnounceAt = now
+                    }
+                    // Just stopped (sharing switched off, or we lost internet): tell the mesh now
+                    // instead of letting requesters discover it by timing out.
+                    !serving && wasServing -> announceGateway(emptySet())
+                }
+                wasServing = serving
+                delay(GATEWAY_TICK_MS)
+            }
+        }
+    }
+
+    private fun announceGateway(kinds: Set<QueryKind>) {
+        sendGatewayMessage(
+            MeshMessage(
+                type = MeshMessageType.GATEWAY_ANNOUNCE,
+                senderId = deviceId,
+                senderName = displayName,
+                targetId = null,
+                body = GatewayAnnounce.encode(kinds),
+            ),
+        )
+    }
+
+    private fun sendGatewayMessage(message: MeshMessage) {
+        rememberEphemeral(message)
+        broadcastToPeers(message.toBytes())
+    }
+
+    /** Dedupe, handle if it's for us, and keep flooding it onward otherwise. */
+    private fun handleGatewayTraffic(fromEndpointId: String, message: MeshMessage) {
+        if (ephemeralCache.containsKey(message.id)) return
+        val forwarded = message.forwarded()
+        rememberEphemeral(forwarded)
+
+        var addressedToMe = false
+        when (message.type) {
+            MeshMessageType.GATEWAY_ANNOUNCE -> handleGatewayAnnounce(message)
+            MeshMessageType.QUERY_REQUEST -> if (message.targetId == deviceId) {
+                addressedToMe = true
+                handleQueryRequest(message)
+            }
+            MeshMessageType.QUERY_RESPONSE -> if (message.targetId == deviceId) {
+                addressedToMe = true
+                handleQueryResponse(message)
+            }
+            else -> return
+        }
+        if (addressedToMe || forwarded.ttl <= 0) return
+        broadcastToPeers(forwarded.toBytes(), excludeEndpointIds = setOf(fromEndpointId))
+    }
+
+    private fun handleGatewayAnnounce(message: MeshMessage) {
+        if (message.senderId == deviceId) return
+        val now = System.currentTimeMillis()
+        gatewayRegistry.update(
+            GatewayInfo(
+                deviceId = message.senderId,
+                name = message.senderName,
+                // hopCount counts relays so far, so a directly connected gateway arrives with 0.
+                hops = message.hopCount + 1,
+                kinds = GatewayAnnounce.decode(message.body),
+                lastSeen = now,
+            ),
+        )
+        _gateways.value = gatewayRegistry.active(now)
+    }
+
+    // ---- Requester side ----
+
+    /** Starts a search / AI query. Returns false (and does nothing) if [rawText] is blank or too long. */
+    fun submitQuery(kind: QueryKind, rawText: String): Boolean {
+        val text = QuerySandbox.cleanQuery(rawText) ?: return false
+        val item = QueryItem(
+            id = UUID.randomUUID().toString().replace("-", "").take(12),
+            kind = kind,
+            text = text,
+            status = QueryStatus.WAITING_FOR_GATEWAY,
+        )
+        _queries.update { (listOf(item) + it).take(MAX_QUERIES_SHOWN) }
+        meshScope.launch { runQuery(item) }
+        return true
+    }
+
+    private fun updateQuery(id: String, transform: (QueryItem) -> QueryItem) {
+        _queries.update { list -> list.map { if (it.id == id) transform(it) else it } }
+    }
+
+    private fun finishQuery(id: String, ok: Boolean, text: String) {
+        pendingQueries.remove(id)
+        updateQuery(id) { it.copy(status = if (ok) QueryStatus.DONE else QueryStatus.FAILED, answer = text) }
+    }
+
+    private suspend fun runQuery(item: QueryItem) {
+        val deadline = System.currentTimeMillis() + QUERY_DEADLINE_MS
+        val tried = mutableSetOf<String>()
+        var attempts = 0
+        var lastError: String? = null
+
+        while (System.currentTimeMillis() < deadline && attempts < MAX_QUERY_ATTEMPTS) {
+            // Already online with the right key? Then no need to involve the mesh at all.
+            if (internet.online.value && item.kind in gatewaySettings.capabilities()) {
+                updateQuery(item.id) { it.copy(status = QueryStatus.RUNNING_LOCALLY, gatewayName = null, hops = null) }
+                val response = withContext(Dispatchers.IO) {
+                    sandbox.execute(QueryRequest(item.id, item.kind, item.text))
+                }
+                finishQuery(item.id, response.ok, response.text)
+                return
+            }
+
+            // Nearest gateway we haven't tried yet and already hold the public key of.
+            val gateway = gatewayRegistry
+                .candidates(item.kind, System.currentTimeMillis(), tried)
+                .firstOrNull { it.deviceId in knownPublicKeys }
+            if (gateway == null) {
+                updateQuery(item.id) { it.copy(status = QueryStatus.WAITING_FOR_GATEWAY, gatewayName = null, hops = null) }
+                delay(QUERY_POLL_MS)
+                continue
+            }
+
+            attempts++
+            tried += gateway.deviceId
+            val pending = PendingQuery(gateway.deviceId, CompletableDeferred())
+            pendingQueries[item.id] = pending
+            updateQuery(item.id) {
+                it.copy(status = QueryStatus.SENT, gatewayName = gateway.name, hops = gateway.hops)
+            }
+            sendQueryRequest(gateway, QueryRequest(item.id, item.kind, item.text))
+
+            val response = withTimeoutOrNull(QUERY_ATTEMPT_TIMEOUT_MS) { pending.reply.await() }
+            pendingQueries.remove(item.id)
+            when {
+                response == null -> {
+                    lastError = "${gateway.name} didn't reply in time."
+                    // Likely out of range by now — don't keep offering it to later queries.
+                    gatewayRegistry.remove(gateway.deviceId)
+                }
+                response.ok -> {
+                    finishQuery(item.id, true, response.text)
+                    return
+                }
+                else -> lastError = response.text
+            }
+        }
+
+        finishQuery(
+            item.id,
+            ok = false,
+            text = lastError
+                ?: "No internet gateway found in the mesh. Ask someone with internet to turn on " +
+                    "\"Share my internet\" in VIT Connect, then try again.",
+        )
+    }
+
+    private fun sendQueryRequest(gateway: GatewayInfo, request: QueryRequest) {
+        val gatewayKey = knownPublicKeys[gateway.deviceId] ?: return
+        val ciphertext = crypto.encrypt(request.toJson(), gatewayKey)
+        sendGatewayMessage(
+            MeshMessage(
+                type = MeshMessageType.QUERY_REQUEST,
+                senderId = deviceId,
+                senderName = displayName,
+                targetId = gateway.deviceId,
+                body = Base64.encodeToString(ciphertext, Base64.NO_WRAP),
+                encrypted = true,
+            ),
+        )
+    }
+
+    private fun handleQueryResponse(message: MeshMessage) {
+        val gatewayKey = knownPublicKeys[message.senderId] ?: return
+        val response = try {
+            QueryResponse.fromJson(crypto.decrypt(Base64.decode(message.body, Base64.NO_WRAP), gatewayKey))
+        } catch (e: Exception) {
+            Log.w(TAG, "Undecryptable QUERY_RESPONSE from ${message.senderId}", e)
+            null
+        } ?: return
+        // The request id is random and was only ever sent encrypted, and the reply must come from
+        // the gateway we actually asked — together that stops anyone else injecting an answer.
+        val pending = pendingQueries[response.requestId] ?: return
+        if (pending.gatewayId != message.senderId) return
+        pending.reply.complete(response)
+    }
+
+    // ---- Gateway side ----
+
+    private fun handleQueryRequest(message: MeshMessage) {
+        // Decrypting with the *claimed* sender's known key doubles as authentication: a request
+        // forged under someone else's deviceId fails the AES-GCM tag check.
+        val senderKey = knownPublicKeys[message.senderId] ?: return
+        val request = try {
+            QueryRequest.fromJson(crypto.decrypt(Base64.decode(message.body, Base64.NO_WRAP), senderKey))
+        } catch (e: Exception) {
+            Log.w(TAG, "Undecryptable QUERY_REQUEST from ${message.senderId}", e)
+            null
+        } ?: return
+
+        fun reply(ok: Boolean, text: String) =
+            sendQueryResponse(message.senderId, QueryResponse(request.requestId, ok, text))
+
+        val offered = gatewayKindsOffered()
+        when {
+            offered.isEmpty() -> reply(false, "This device isn't sharing its internet right now.")
+            request.kind !in offered -> reply(false, "This gateway can't do ${request.kind.label}.")
+            !requestLimiter.tryAcquire(message.senderId, System.currentTimeMillis()) ->
+                reply(false, "Too many requests from you — wait a few minutes and try again.")
+            activeExecutions >= GatewayLimits.MAX_CONCURRENT_EXECUTIONS ->
+                reply(false, "This gateway is busy. Try again in a moment.")
+            else -> {
+                activeExecutions++
+                meshScope.launch {
+                    val response = try {
+                        withContext(Dispatchers.IO) { sandbox.execute(request) }
+                    } finally {
+                        activeExecutions--
+                    }
+                    sendQueryResponse(message.senderId, response)
+                }
+            }
+        }
+    }
+
+    private fun sendQueryResponse(requesterId: String, response: QueryResponse) {
+        val requesterKey = knownPublicKeys[requesterId] ?: return
+        val ciphertext = crypto.encrypt(response.toJson(), requesterKey)
+        sendGatewayMessage(
+            MeshMessage(
+                type = MeshMessageType.QUERY_RESPONSE,
+                senderId = deviceId,
+                senderName = displayName,
+                targetId = requesterId,
+                body = Base64.encodeToString(ciphertext, Base64.NO_WRAP),
+                encrypted = true,
+            ),
+        )
     }
 
     // ---------------------------------------------------------------------------------------
@@ -513,6 +881,11 @@ class MeshManager(private val appContext: Context) {
             if (payload.type != Payload.Type.BYTES) return
             val bytes = payload.asBytes() ?: return
             val message = MeshMessage.fromBytes(bytes) ?: return
+
+            if (message.type.isGatewayTraffic) {
+                handleGatewayTraffic(endpointId, message)
+                return
+            }
 
             if (relayCache.containsKey(message.id)) {
                 // Already processed this exact message via this or another path in the mesh —

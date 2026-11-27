@@ -35,6 +35,7 @@ import com.offgridmesh.vitconnect.ui.screens.ChatScreen
 import com.offgridmesh.vitconnect.ui.screens.DirectChatScreen
 import com.offgridmesh.vitconnect.ui.screens.DirectoryScreen
 import com.offgridmesh.vitconnect.ui.screens.MyQrScreen
+import com.offgridmesh.vitconnect.ui.screens.SearchScreen
 import com.offgridmesh.vitconnect.ui.theme.MeshPurpleLight
 import com.offgridmesh.vitconnect.ui.theme.OffGridMeshTheme
 
@@ -99,6 +100,11 @@ private fun OffGridMeshRoot(viewModel: MeshViewModel) {
             AppScreen.MeshChat -> ChatScreen(
                 viewModel = viewModel,
                 onOpenDirectory = { screen = AppScreen.Directory },
+                onOpenSearch = { screen = AppScreen.Search },
+            )
+            AppScreen.Search -> SearchScreen(
+                viewModel = viewModel,
+                onBack = { screen = AppScreen.MeshChat },
             )
             AppScreen.Directory -> DirectoryScreen(
                 viewModel = viewModel,
@@ -126,6 +132,7 @@ private sealed class AppScreen {
     data object MeshChat : AppScreen()
     data object Directory : AppScreen()
     data object MyQr : AppScreen()
+    data object Search : AppScreen()
     data class DirectChat(val peerDeviceId: String) : AppScreen()
 }
 

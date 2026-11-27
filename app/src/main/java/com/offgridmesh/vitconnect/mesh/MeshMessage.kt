@@ -16,7 +16,29 @@ enum class MeshMessageType {
      * intercepts it to populate the known-devices directory and enable E2E encryption for
      * direct messages, then relays it onward like any other message.
      */
-    KEY_ANNOUNCE;
+    KEY_ANNOUNCE,
+
+    /**
+     * "I have internet and will run searches / AI questions for the mesh." Body is a small JSON
+     * list of the query kinds on offer. Heartbeat-style and perishable, so it is flooded and
+     * deduped through [MeshManager]'s in-memory ephemeral cache rather than the persisted relay
+     * cache. Never shown in any chat UI.
+     */
+    GATEWAY_ANNOUNCE,
+
+    /**
+     * A search / AI question addressed to one gateway ([MeshMessage.targetId]). Body is the
+     * request JSON encrypted to that gateway with the same ECDH+AES-GCM scheme as direct
+     * messages, so relays between requester and gateway only ever see ciphertext.
+     */
+    QUERY_REQUEST,
+
+    /** The gateway's answer, encrypted to the original requester. */
+    QUERY_RESPONSE;
+
+    /** Perishable gateway traffic: deduped/replayed from memory, never persisted or shown in chat. */
+    val isGatewayTraffic: Boolean
+        get() = this == GATEWAY_ANNOUNCE || this == QUERY_REQUEST || this == QUERY_RESPONSE
 
     companion object {
         fun fromWire(raw: String): MeshMessageType =
